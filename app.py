@@ -1,32 +1,48 @@
 
-import streamlit as st
-import cv2
-import tempfile
 import os
-import pandas as pd
+import tempfile
 import subprocess
-import imageio_ffmpeg
-
 from collections import Counter
+
+import cv2
+import pandas as pd
+import streamlit as st
+import imageio_ffmpeg
 from ultralytics import YOLO
 
+
+# --------------------------------------------------
+# PAGE CONFIGURATION
+# --------------------------------------------------
 st.set_page_config(
-    page_title="Smart Campus Traffic",
+    page_title="Smart Campus Traffic Light System",
     page_icon="🚦",
     layout="wide"
 )
 
 st.title("🚦 Smart Campus Traffic Light System")
-st.caption("AI-based vehicle detection and adaptive signal simulation")
+st.caption(
+    "AI-based vehicle detection and adaptive traffic signal simulation"
+)
 
 
+# --------------------------------------------------
+# LOAD YOLO MODEL
+# --------------------------------------------------
 @st.cache_resource
 def load_model():
     return YOLO("yolov8n.pt")
 
 
-model = load_model()
+try:
+    model = load_model()
+except Exception as e:
+    st.error("Could not load the YOLO model.")
+    st.exception(e)
+    st.stop()
 
+
+# COCO vehicle class IDs
 VEHICLES = {
     2: "Car",
     3: "Motorcycle",
@@ -34,6 +50,10 @@ VEHICLES = {
     7: "Truck"
 }
 
+
+# --------------------------------------------------
+# VIDEO UPLOAD
+# --------------------------------------------------
 uploaded_video = st.file_uploader(
     "Upload a traffic video",
     type=["mp4", "avi", "mov", "mkv"]
@@ -47,37 +67,57 @@ confidence = st.slider(
     step=0.05
 )
 
-if uploaded_video and st.button("Analyze Traffic", type="primary"):
 
-    temp_input = tempfile.NamedTemporaryFile(
-        delete=False, suffix=".mp4"
-    )
-    temp_input.write(uploaded_video.read())
-    temp_input.close()
+# --------------------------------------------------
+# PROCESS VIDEO
+# --------------------------------------------------
+if uploaded_video and st.button(
+    "Analyze Traffic",
+    type="primary"
+):
 
+    temp_input_path = None
     output_path = None
     converted_path = None
+    cap = None
+    writer = None
 
     try:
-        cap = cv2.VideoCapture(temp_input.name)
+        # Save uploaded video
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=".mp4"
+        ) as temp_file:
+            temp_file.write(uploaded_video.getvalue())
+            temp_input_path = temp_file.name
+
+        cap = cv2.VideoCapture(temp_input_path)
 
         if not cap.isOpened():
-            st.error("Could not open this video.")
+            st.error(
+                "Could not open the uploaded video. "
+                "Try another MP4 video."
+            )
             st.stop()
 
         fps = cap.get(cv2.CAP_PROP_FPS)
         if not fps or fps <= 0:
-            fps = 25
+            fps = 25.0
 
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        output_file = tempfile.NamedTemporaryFile(
-            delete=False, suffix=".mp4"
-        )
-        output_path = output_file.name
-        output_file.close()
+        if width <= 0 or height <= 0:
+            st.error("The uploaded video has invalid dimensions.")
+            st.stop()
+
+        # Create output video
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=".mp4"
+        ) as output_file:
+            output_path = output_file.name
 
         writer = cv2.VideoWriter(
             output_path,
@@ -87,15 +127,16 @@ if uploaded_video and st.button("Analyze Traffic", type="primary"):
         )
 
         if not writer.isOpened():
-            cap.release()
             st.error("Could not create the output video.")
             st.stop()
 
         records = []
         progress = st.progress(0)
         status = st.empty()
+
         frame_index = 0
 
+        # Process every frame
         while True:
             ok, frame = cap.read()
 
@@ -103,24 +144,32 @@ if uploaded_video and st.button("Analyze Traffic", type="primary"):
                 break
 
             result = model.predict(
-                frame,
+                source=frame,
                 conf=confidence,
                 classes=list(VEHICLES.keys()),
                 imgsz=640,
                 verbose=False
             )[0]
 
-            counts = Counter(
-                VEHICLES[int(c)]
-                for c in result.boxes.cls.cpu().numpy()
-            )
+            counts = Counter()
+
+            if result.boxes is not None:
+                class_ids = (
+                    result.boxes.cls.cpu().numpy().astype(int)
+                )
+
+                for class_id in class_ids:
+                    if class_id in VEHICLES:
+                        counts[VEHICLES[class_id]] += 1
 
             total = sum(counts.values())
+
+            # Draw YOLO bounding boxes
             annotated = result.plot()
 
             cv2.putText(
                 annotated,
-                f"Vehicles: {total}",
+                f"Vehicles detected: {total}",
                 (20, 40),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1,
@@ -147,20 +196,41 @@ if uploaded_video and st.button("Analyze Traffic", type="primary"):
                 )
 
             if frame_index % 20 == 0:
-                status.write(
-                    f"Analyzing frame {frame_index}..."
+                status.info(
+                    f"Processing frame {frame_index}"
+                    + (
+                        f" of {total_frames}"
+                        if total_frames > 0
+                        else ""
+                    )
                 )
 
         cap.release()
+        cap = None
+
         writer.release()
-        status.write("Video processing finished.")
+        writer = None
 
-        df = pd.DataFrame(records)
+        progress.progress(1.0)
+        status.success("Video processing completed!")
 
-        if df.empty:
+        # Check output
+        if not records:
             st.error("No video frames were processed.")
             st.stop()
 
+        df = pd.DataFrame(records)
+
+        if (
+            not os.path.exists(output_path)
+            or os.path.getsize(output_path) == 0
+        ):
+            st.error("The output video file is empty.")
+            st.stop()
+
+        # --------------------------------------------------
+        # CONGESTION ESTIMATION
+        # --------------------------------------------------
         average_count = float(df["Total"].mean())
         peak_count = int(df["Total"].max())
 
@@ -174,86 +244,134 @@ if uploaded_video and st.button("Analyze Traffic", type="primary"):
             congestion = "High"
             green_seconds = 30
 
-        st.success("Traffic analysis complete!")
+        st.success("Traffic analysis completed!")
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Average detections/frame", f"{average_count:.1f}")
-        c2.metric("Peak detections/frame", peak_count)
-        c3.metric("Estimated congestion", congestion)
-        c4.metric("Suggested green duration", f"{green_seconds} sec")
+        col1, col2, col3, col4 = st.columns(4)
 
-        st.subheader("🚦 Simulated signal recommendation")
+        col1.metric(
+            "Average detections/frame",
+            f"{average_count:.1f}"
+        )
+        col2.metric(
+            "Peak detections/frame",
+            peak_count
+        )
+        col3.metric(
+            "Estimated congestion",
+            congestion
+        )
+        col4.metric(
+            "Suggested green duration",
+            f"{green_seconds} sec"
+        )
+
+        st.subheader("🚦 Adaptive Signal Recommendation")
+
         st.info(
-            f"Traffic level: {congestion}. "
+            f"Estimated congestion: {congestion}. "
             f"Suggested green duration: {green_seconds} seconds."
         )
 
         st.caption(
-            "This prototype analyzes one camera view. "
-            "It does not yet compare multiple lanes or implement "
-            "a complete traffic-light cycle."
+            "This initial prototype analyzes a single camera view. "
+            "It recommends a timing based on average detections; "
+            "it does not yet measure real queue length, compare "
+            "multiple lanes, or implement a complete signal cycle."
         )
 
-        st.subheader("🎥 Vehicle detection output")
+        # --------------------------------------------------
+        # CONVERT VIDEO FOR BROWSER PLAYBACK
+        # --------------------------------------------------
+        st.subheader("🎥 Vehicle Detection Output")
 
         converted_path = output_path.replace(
-            ".mp4", "_browser.mp4"
+            ".mp4",
+            "_browser.mp4"
         )
 
-        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+        try:
+            ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
 
-        conversion = subprocess.run(
-            [
-                ffmpeg_path,
-                "-y",
-                "-i", output_path,
-                "-c:v", "libx264",
-                "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
-                "-an",
-                converted_path
-            ],
-            capture_output=True,
-            text=True
-        )
-
-        if (
-            conversion.returncode == 0
-            and os.path.exists(converted_path)
-            and os.path.getsize(converted_path) > 0
-        ):
-            st.video(converted_path)
-        else:
-            st.warning(
-                "Video conversion failed. "
-                "Trying to display the original video."
+            conversion = subprocess.run(
+                [
+                    ffmpeg_path,
+                    "-y",
+                    "-i", output_path,
+                    "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p",
+                    "-movflags", "+faststart",
+                    "-an",
+                    converted_path
+                ],
+                capture_output=True,
+                text=True,
+                timeout=180
             )
-            st.video(output_path)
 
-            with st.expander("Conversion details"):
-                st.code(conversion.stderr[-3000:])
+            if (
+                conversion.returncode == 0
+                and os.path.exists(converted_path)
+                and os.path.getsize(converted_path) > 0
+            ):
+                with open(converted_path, "rb") as video_file:
+                    video_bytes = video_file.read()
 
-        st.subheader("📊 Vehicle counts over time")
+                st.video(video_bytes, format="video/mp4")
+
+            else:
+                st.warning(
+                    "Browser-compatible conversion failed. "
+                    "Trying the original output video."
+                )
+
+                with open(output_path, "rb") as video_file:
+                    st.video(video_file.read(), format="video/mp4")
+
+                with st.expander("Video conversion details"):
+                    st.code(conversion.stderr[-3000:])
+
+        except Exception as video_error:
+            st.warning(
+                "The video was processed, but playback conversion failed."
+            )
+            st.exception(video_error)
+
+        # --------------------------------------------------
+        # CHART AND DATA
+        # --------------------------------------------------
+        st.subheader("📊 Vehicle Counts Over Time")
+
         st.line_chart(
             df.set_index("Time (seconds)")["Total"]
         )
 
-        st.subheader("Detection data")
-        st.dataframe(df.head(100), use_container_width=True)
+        st.subheader("Vehicle Detection Report")
+
+        st.dataframe(
+            df.head(100),
+            use_container_width=True
+        )
 
         st.download_button(
-            "Download detection report CSV",
+            "⬇️ Download Detection Report (CSV)",
             data=df.to_csv(index=False).encode("utf-8"),
             file_name="traffic_report.csv",
             mime="text/csv"
         )
 
     except Exception as e:
-        st.error(f"Analysis failed: {e}")
+        st.error("An error occurred during traffic analysis.")
+        st.exception(e)
 
     finally:
+        if cap is not None:
+            cap.release()
+
+        if writer is not None:
+            writer.release()
+
         for path in [
-            temp_input.name,
+            temp_input_path,
             output_path,
             converted_path
         ]:
@@ -262,3 +380,14 @@ if uploaded_video and st.button("Analyze Traffic", type="primary"):
                     os.remove(path)
                 except OSError:
                     pass
+
+
+# --------------------------------------------------
+# FOOTER
+# --------------------------------------------------
+st.divider()
+st.caption(
+    "Smart Campus Traffic Light System | "
+    "Educational AI prototype — not for direct control "
+    "of real traffic infrastructure."
+)
