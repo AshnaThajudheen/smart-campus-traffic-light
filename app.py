@@ -5,6 +5,8 @@ import os
 import pandas as pd
 from collections import Counter
 from ultralytics import YOLO
+import subprocess
+import imageio_ffmpeg
 
 st.set_page_config(
     page_title="Smart Campus Traffic",
@@ -186,7 +188,35 @@ if uploaded_video and st.button("Analyze Traffic", type="primary"):
         )
 
         st.subheader("🎥 Vehicle detection output")
-        st.video(output_path)
+        # Convert the OpenCV output to browser-compatible H.264 MP4
+converted_path = output_path.replace(".mp4", "_browser.mp4")
+
+ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+
+result = subprocess.run(
+    [
+        ffmpeg_path,
+        "-y",
+        "-i", output_path,
+        "-vcodec", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-an",
+        converted_path
+    ],
+    capture_output=True,
+    text=True
+)
+
+if result.returncode == 0 and os.path.exists(converted_path):
+    with open(converted_path, "rb") as video_file:
+        st.video(video_file.read())
+else:
+    st.warning("Video conversion failed. Showing the original output.")
+    st.video(output_path)
+
+if os.path.exists(converted_path):
+    os.remove(converted_path)
 
         st.subheader("📊 Vehicle counts over time")
         st.line_chart(
